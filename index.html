@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes, viewport-fit=cover">
+    <!-- Keeps the in-progress build out of search results. A robots.txt cannot do this job: it is
+         only read from the domain root, and this game is served from a /game/ project path. Drop
+         this tag when the game is ready to be found. -->
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="theme-color" content="#231F20">
+    <!-- Home-screen "Add to Home Screen" standalone launch on iOS: Safari does not act on
+         the manifest's display:fullscreen, only these meta tags hide the browser chrome. -->
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Game">
+    <!-- Deliberately anonymous while the build is unlisted: the tab title is what a shared link
+         and a search result show, so it must not name the game. -->
+    <title>Game</title>
+    <link rel="shortcut icon" href="TemplateData/favicon.ico">
+    <link rel="apple-touch-icon" href="TemplateData/icons/apple-touch-icon.png">
+    <link rel="stylesheet" href="TemplateData/style.css">
+    <link rel="manifest" href="manifest.webmanifest">
+  </head>
+  <body>
+    <div id="unity-container">
+      <canvas id="unity-canvas" tabindex="-1"></canvas>
+      <div id="unity-loading-bar">
+        <div id="unity-logo"></div>
+        <div id="unity-progress-bar-empty">
+          <div id="unity-progress-bar-full"></div>
+        </div>
+      </div>
+      <div id="unity-warning"> </div>
+      <div id="unity-status"></div>
+    </div>
+    <script>
+      window.addEventListener("load", function () {
+        if ("serviceWorker" in navigator) {
+          navigator.serviceWorker.register("ServiceWorker.js");
+        }
+      });
+
+      var container = document.querySelector("#unity-container");
+      var canvas = document.querySelector("#unity-canvas");
+      var loadingBar = document.querySelector("#unity-loading-bar");
+      var progressBarFull = document.querySelector("#unity-progress-bar-full");
+      var warningBanner = document.querySelector("#unity-warning");
+
+      // Shows a temporary message banner/ribbon for a few seconds, or
+      // a permanent error message on top of the canvas if type=='error'.
+      // If type=='warning', a yellow highlight color is used.
+      // Modify or remove this function to customize the visually presented
+      // way that non-critical warnings and error messages are presented to the
+      // user.
+      function unityShowBanner(msg, type) {
+        function updateBannerVisibility() {
+          warningBanner.style.display = warningBanner.children.length ? 'block' : 'none';
+        }
+        var div = document.createElement('div');
+        div.innerHTML = msg;
+        warningBanner.appendChild(div);
+        if (type == 'error') div.style = 'background: red; padding: 10px;';
+        else {
+          if (type == 'warning') div.style = 'background: yellow; padding: 10px;';
+          setTimeout(function() {
+            warningBanner.removeChild(div);
+            updateBannerVisibility();
+          }, 5000);
+        }
+        updateBannerVisibility();
+      }
+
+      var buildUrl = "Build";
+      var loaderUrl = buildUrl + "/Build.loader.js";
+      var config = {
+        arguments: [],
+        dataUrl: buildUrl + "/Build.data.unityweb",
+        frameworkUrl: buildUrl + "/Build.framework.js.unityweb",
+        codeUrl: buildUrl + "/Build.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        // Anonymised while the build is unlisted: these strings are visible in page source, and
+        // the real ones name both the game and its author. Saves are unaffected — WebGLSaveStorage
+        // writes to localStorage under its own prefix, not the product-derived IndexedDB path.
+        companyName: "Game",
+        productName: "Game",
+        productVersion: "0.6.0.83",
+        showBanner: unityShowBanner,
+        // errorHandler: function(err, url, line) {
+        //    alert("error " + err + " occurred at line " + line);
+        //    // Return 'true' if you handled this error and don't want Unity
+        //    // to process it further, 'false' otherwise.
+        //    return true;
+        // },
+      };
+
+      // By default Unity keeps WebGL canvas render target size matched with
+      // the DOM size of the canvas element (scaled by window.devicePixelRatio)
+      // Set this to false if you want to decouple this synchronization from
+      // happening inside the engine, and you would instead like to size up
+      // the canvas DOM size and WebGL render target sizes yourself.
+      // config.matchWebGLToCanvasSize = false;
+
+
+      loadingBar.style.display = "block";
+
+      // Unity's loader (and the framework's wasm fallback) fetch every Build/ file through the
+      // global fetch, and over a flaky connection one dropped request used to end the load with
+      // alert("Script error."). This wraps fetch for Build/ files only: a failed request or a
+      // 5xx retries with backoff, a body that drops mid-stream resumes from the received byte
+      // with a Range request, a retry that is still going after 2 s gets an inline notice, and a
+      // file that still fails after the budget is reported inline, naming the file and reason.
+      var statusEl = document.querySelector("#unity-status");
+      var buildOrigin = new URL(buildUrl + "/", location.href).href;
+      var retryDelaysMs = [500, 1000, 2000, 4000];
+      var retryNoticeAfterMs = 2000;
+      var filesRetrying = 0;
+      var retryNoticeTimer = 0;
+      var fatalError = null;
+      var nativeFetch = window.fetch.bind(window);
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function showStatus(text, button) {
+        statusEl.textContent = "";
+        statusEl.appendChild(document.createTextNode(text));
+        if (button) statusEl.appendChild(button);
+        statusEl.style.display = "block";
+      }
+
+      function retryStarted() {
+        filesRetrying++;
+        if (retryNoticeTimer) return;
+        retryNoticeTimer = setTimeout(() => {
+          if (filesRetrying > 0 && !fatalError)
+            showStatus("The tide's running slow. Retrying the download for you…");
+        }, retryNoticeAfterMs);
+      }
+
+      function retrySucceeded() {
+        filesRetrying--;
+        if (filesRetrying > 0) return;
+        clearTimeout(retryNoticeTimer);
+        retryNoticeTimer = 0;
+        if (!fatalError) statusEl.style.display = "none";
+      }
+
+      function showFatal(reason) {
+        if (fatalError) return;
+        fatalError = reason;
+        clearTimeout(retryNoticeTimer);
+        var reload = document.createElement("button");
+        reload.textContent = "Reload";
+        reload.onclick = () => location.reload();
+        showStatus("The download didn't make it: " + reason + " Check your connection and try again.", reload);
+      }
+
+      function fetchBuildFile(url, init) {
+        var fileName = url.slice(buildOrigin.length);
+        var attempt = 0;
+        var pendingRetry = false;
+
+        function fail(reason) {
+          if (attempt >= retryDelaysMs.length) {
+            showFatal(fileName + " (" + reason + ").");
+            return Promise.reject(new TypeError(fileName + ": " + reason));
+          }
+          var delay = retryDelaysMs[attempt++];
+          if (!pendingRetry) { pendingRetry = true; retryStarted(); }
+          console.warn("Retrying " + fileName + " in " + delay + " ms: " + reason);
+          return sleep(delay);
+        }
+
+        function retriable(status) {
+          return status >= 500 || status === 408 || status === 429;
+        }
+
+        function request(offset) {
+          var options = Object.assign({}, init);
+          if (offset > 0) options.headers = Object.assign({}, init && init.headers, { Range: "bytes=" + offset + "-" });
+          return nativeFetch(url, options).then((response) => {
+            if (retriable(response.status)) return fail("HTTP " + response.status).then(() => request(offset));
+            if (!response.ok) {
+              showFatal(fileName + " (HTTP " + response.status + ").");
+              return response;
+            }
+            if (pendingRetry) { pendingRetry = false; retrySucceeded(); }
+            return response;
+          }, (error) => fail(String(error && error.message || error)).then(() => request(offset)));
+        }
+
+        function resumableBody(first) {
+          var reader = first.body.getReader();
+          var received = 0;
+          var skip = 0;
+          // A pull must enqueue or close before returning; a pull that returns empty-handed stalls
+          // the stream, so resuming and prefix-skipping loop here instead of yielding.
+          async function pull(controller) {
+            for (;;) {
+              var result;
+              try {
+                result = await reader.read();
+              } catch (error) {
+                await fail(String(error && error.message || error));
+                var response = await request(received);
+                if (!response.ok) throw new TypeError(fileName + ": HTTP " + response.status);
+                // 206 continues from the requested byte; a 200 means the server ignored the Range
+                // and is sending the whole file again, so the already-received prefix is skipped.
+                skip = response.status === 206 ? 0 : received;
+                reader = response.body.getReader();
+                continue;
+              }
+              if (result.done) { controller.close(); return; }
+              var chunk = result.value;
+              if (skip > 0) {
+                var n = Math.min(skip, chunk.length);
+                skip -= n;
+                chunk = chunk.subarray(n);
+                if (chunk.length === 0) continue;
+              }
+              received += chunk.length;
+              controller.enqueue(chunk);
+              return;
+            }
+          }
+          return new ReadableStream({ pull: pull, cancel: (reason) => reader.cancel(reason) });
+        }
+
+        return request(0).then((response) => {
+          if (!response.ok || !response.body) return response;
+          return new Response(resumableBody(response), {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        });
+      }
+
+      window.fetch = function (input, init) {
+        var url = new URL(typeof input === "string" ? input : input.url, location.href).href;
+        var method = (init && init.method) || (typeof input === "string" ? "GET" : input.method);
+        if (!url.startsWith(buildOrigin) || method !== "GET") return nativeFetch(input, init);
+        return fetchBuildFile(url, init);
+      };
+
+      var script = document.createElement("script");
+      script.src = loaderUrl;
+      script.onload = () => {
+        createUnityInstance(canvas, config, (progress) => {
+          progressBarFull.style.width = 100 * progress + "%";
+        }).then((unityInstance) => {
+          loadingBar.style.display = "none";
+        }).catch((message) => {
+          console.error(message);
+          showFatal(String(message) + ".");
+        });
+      };
+      document.body.appendChild(script);
+    </script>
+  </body>
+</html>
