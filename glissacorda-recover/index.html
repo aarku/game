@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Glissacorda recovery</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 16px; font: 15px/1.45 -apple-system, system-ui, sans-serif; background: #1b1a18; color: #ece8e1; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  p { margin: 0 0 12px; color: #b9b3a8; }
+  button { font: inherit; padding: 12px 16px; border-radius: 10px; border: 1px solid #555; background: #2a2825; color: #ece8e1; width: 100%; margin-bottom: 10px; }
+  button:disabled { opacity: .5; }
+  pre { white-space: pre-wrap; word-break: break-word; background: #11100f; padding: 10px; border-radius: 8px; font-size: 12px; min-height: 60px; }
+  .ok { color: #8fd18f; } .bad { color: #ff8a80; }
+</style>
+</head>
+<body>
+<h1>Glissacorda recovery</h1>
+<p>This page only reads this browser's saved data for the app. It does not open the app, does not sync, and writes nothing here. It sends a copy of everything it finds to the Glissacorda server so the lost songs can be dug out.</p>
+<button id="send">Send a copy to the server</button>
+<button id="save">Also download the copy to this phone</button>
+<pre id="log"></pre>
+<script>
+const SUPABASE_URL = 'https://dkvwgiqbeoblyhrwccsg.supabase.co';
+const ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRrdndnaXFiZW9ibHlocndjY3NnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAwNTE1NTIsImV4cCI6MjEwNTYyNzU1Mn0.b7R8BILmD37HJDogav0jWSQNSDISNGINGgiM11u3p9w';
+const CHUNK = 400000;
+
+const logEl = document.getElementById('log');
+const log = (msg, cls) => {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+};
+
+function toB64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+/** Typed arrays and buffers become {__b64}, so the copy is plain JSON. */
+function plain(v) {
+  if (v instanceof ArrayBuffer) return { __b64: toB64(new Uint8Array(v)) };
+  if (ArrayBuffer.isView(v)) return { __b64: toB64(new Uint8Array(v.buffer, v.byteOffset, v.byteLength)) };
+  if (Array.isArray(v)) return v.map(plain);
+  if (v && typeof v === 'object') {
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = plain(v[k]);
+    return o;
+  }
+  return v;
+}
+
+const req = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+
+async function dumpDatabase(name) {
+  // Opening without a version never upgrades or changes the database.
+  const db = await new Promise((res, rej) => {
+    const r = indexedDB.open(name);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+    r.onupgradeneeded = () => { r.transaction.abort(); rej(new Error('database ' + name + ' does not exist')); };
+  });
+  const out = { name, version: db.version, stores: {} };
+  for (const store of db.objectStoreNames) {
+    const tx = db.transaction(store, 'readonly');
+    const os = tx.objectStore(store);
+    const [keys, values] = await Promise.all([req(os.getAllKeys()), req(os.getAll())]);
+    out.stores[store] = keys.map((k, i) => ({ key: plain(k), value: plain(values[i]) }));
+    log(`  ${name} / ${store}: ${keys.length} records`);
+  }
+  db.close();
+  return out;
+}
+
+let copy = null;
+
+async function collect() {
+  if (copy) return copy;
+  log('Reading saved data…');
+  let names = [];
+  if (indexedDB.databases) names = (await indexedDB.databases()).map((d) => d.name).filter(Boolean);
+  for (const guess of ['glissacorda.sqlite', 'glissacorda']) if (!names.includes(guess)) names.push(guess);
+  const databases = [];
+  for (const n of names) {
+    try { databases.push(await dumpDatabase(n)); }
+    catch (e) { log(`  ${n}: ${e.message}`); }
+  }
+  const storage = {};
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && (k.startsWith('glissacorda') || k.startsWith('sb-') || k.includes('powersync'))) storage[k] = localStorage.getItem(k);
+  }
+  copy = JSON.stringify({ when: new Date().toISOString(), userAgent: navigator.userAgent, href: location.href, databases, storage });
+  log(`Read ${(copy.length / 1e6).toFixed(2)} MB.`);
+  return copy;
+}
+
+async function gzipB64(text) {
+  if (typeof CompressionStream === 'undefined') return { enc: 'json', b64: toB64(new TextEncoder().encode(text)) };
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+  const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+  return { enc: 'gzip', b64: toB64(buf) };
+}
+
+document.getElementById('send').onclick = async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  try {
+    const text = await collect();
+    const { enc, b64 } = await gzipB64(text);
+    const dumpId = `${enc}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const total = Math.ceil(b64.length / CHUNK);
+    for (let i = 0; i < total; i++) {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/recovery_dumps`, {
+        method: 'POST',
+        headers: { apikey: ANON_KEY, Authorization: `Bearer ${ANON_KEY}`, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify({ dump_id: dumpId, seq: i, total, chunk: b64.slice(i * CHUNK, (i + 1) * CHUNK) }),
+      });
+      if (!res.ok) throw new Error(`upload ${i + 1}/${total} failed: ${res.status} ${await res.text()}`);
+      log(`Sent part ${i + 1} of ${total}`);
+    }
+    log(`Done. Copy ${dumpId} is on the server.`, 'ok');
+  } catch (err) {
+    log(`Failed: ${err && err.message ? err.message : err}`, 'bad');
+    btn.disabled = false;
+  }
+};
+
+document.getElementById('save').onclick = async () => {
+  try {
+    const text = await collect();
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `glissacorda-recovery-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    log('Download started.', 'ok');
+  } catch (err) {
+    log(`Failed: ${err && err.message ? err.message : err}`, 'bad');
+  }
+};
+</script>
+</body>
+</html>
